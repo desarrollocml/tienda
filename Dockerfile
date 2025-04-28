@@ -1,74 +1,83 @@
-# To use this Dockerfile, you have to set `output: 'standalone'` in your next.config.mjs file.
-# From https://github.com/vercel/next.js/blob/canary/examples/with-docker/Dockerfile
+# --- Stage 1: Builder ---
+# This stage is used to install all dependencies (including dev) and build the application.
+FROM node:20-alpine AS builder
 
-FROM node:22.12.0-alpine AS base
-
-# Install dependencies only when needed
-FROM base AS deps
-# Check https://github.com/nodejs/docker-node/tree/b4117f9333da4138b03a546ec926ef50a31506c3#nodealpine to understand why libc6-compat might be needed.
-RUN apk add --no-cache libc6-compat
+# Set the working directory inside the container
 WORKDIR /app
 
-# Install dependencies based on the preferred package manager
+# Install libc6-compat for some compatibility issues that might arise on Alpine
+# https://github.com/nodejs/docker-node/tree/b4117f9333da4138b03a546ec926ef50a31506c3#nodealpine
+RUN apk add --no-cache libc6-compat
+
+# Copy package.json and lock file(s) first to leverage Docker's build cache
+# This step is smart enough to use yarn.lock, package-lock.json, or pnpm-lock.yaml
 COPY package.json yarn.lock* package-lock.json* pnpm-lock.yaml* ./
 
-RUN ls -la ./
-
+# Install dependencies based on the lock file found
 RUN \
-  if [ -f yarn.lock ]; then yarn --frozen-lockfile; \
-  elif [ -f package-lock.json ]; then npm ci; \
-  elif [ -f pnpm-lock.yaml ]; then corepack enable pnpm && pnpm i --frozen-lockfile; \
-  else echo "Lockfile not found." && exit 1; \
+  if [ -f yarn.lock ]; then echo "Installing with yarn..."; yarn --frozen-lockfile; \
+  elif [ -f package-lock.json ]; then echo "Installing with npm ci..."; npm ci; \
+  elif [ -f pnpm-lock.yaml ]; then echo "Installing with pnpm..."; corepack enable pnpm && pnpm i --frozen-lockfile; \
+  else echo "Lockfile not found. Using npm install fallback (not recommended)."; npm install; \
   fi
 
-
-# Rebuild the source code only when needed
-FROM base AS builder
-WORKDIR /app
-COPY --from=deps /app/node_modules ./node_modules
+# Copy the rest of your application code
 COPY . .
 
-# Next.js collects completely anonymous telemetry data about general usage.
-# Learn more here: https://nextjs.org/telemetry
-# Uncomment the following line in case you want to disable telemetry during the build.
-# ENV NEXT_TELEMETRY_DISABLED 1
+# Set NODE_ENV to production for the build process
+ENV NODE_ENV production
 
+# Execute the build script from package.json
+# This script should generate the production files (e.g., in ./build)
 RUN \
-  if [ -f yarn.lock ]; then yarn run build; \
-  elif [ -f package-lock.json ]; then npm run build; \
-  elif [ -f pnpm-lock.yaml ]; then corepack enable pnpm && pnpm run build; \
-  else echo "Lockfile not found." && exit 1; \
+  if [ -f yarn.lock ]; then echo "Building with yarn..."; yarn run build; \
+  elif [ -f package-lock.json ]; then echo "Building with npm..."; npm run build; \
+  elif [ -f pnpm-lock.yaml ]; then echo "Building with pnpm..."; pnpm run build; \
+  else echo "Building with npm (fallback)..."; npm run build; \
   fi
 
-# Production image, copy all the files and run next
-FROM base AS runner
+# --- Stage 2: Runner ---
+# This stage is for the final, lightweight production image.
+FROM node:20-alpine AS runner
+
+# Set the working directory
 WORKDIR /app
 
+# Copy only the production dependencies from the builder stage (more secure and smaller image)
+# Using the package manager used in the builder stage
+COPY --from=builder /app/package.json ./package.json
+RUN \
+  if [ -f /app/yarn.lock ]; then echo "Installing production dependencies with yarn..."; yarn install --production --frozen-lockfile; \
+  elif [ -f /app/package-lock.json ]; then echo "Installing production dependencies with npm..."; npm install --production --immutable --ignore-scripts; \
+  elif [ -f /app/pnpm-lock.yaml ]; then echo "Installing production dependencies with pnpm..."; corepack enable pnpm && pnpm install --prod --frozen-lockfile; \
+  else echo "Installing production dependencies with npm (fallback)..."; npm install --production; \
+  fi
+
+
+# Copy the built application code (the output of the build script) from the builder stage
+COPY --from=builder /app/build ./build
+
+# Optional: Copy your public directory if you have static assets there not managed by Payload uploads
+# Ensure this directory exists in your project root
+# COPY --from=builder /app/public ./public
+
+# Configure the application environment for production
 ENV NODE_ENV production
-# Uncomment the following line in case you want to disable telemetry during runtime.
-# ENV NEXT_TELEMETRY_DISABLED 1
-
-RUN addgroup --system --gid 1001 nodejs
-RUN adduser --system --uid 1001 nextjs
-
-# Remove this line if you do not have this folder
-COPY --from=builder /app/public ./public
-
-# Set the correct permission for prerender cache
-RUN mkdir .next
-RUN chown nextjs:nodejs .next
-
-# Automatically leverage output traces to reduce image size
-# https://nextjs.org/docs/advanced-features/output-file-tracing
-COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
-COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
-
-USER nextjs
-
-EXPOSE 3000
-
+# Railway will inject the actual PORT, but setting a default is standard
 ENV PORT 3000
 
-# server.js is created by next build from the standalone output
-# https://nextjs.org/docs/pages/api-reference/next-config-js/output
-CMD HOSTNAME="0.0.0.0" node server.js
+# Optional: Create a non-root user for security
+# RUN addgroup --system --gid 1001 nodejs \
+#     && adduser --system --uid 1001 --shell /bin/sh --no-create-home -G nodejs nodejs
+# RUN chown -R nodejs:nodejs /app # Give ownership of the app directory
+# USER nodejs # Switch to the non-root user
+
+# Expose the port the application listens on
+EXPOSE 3000
+
+# Command to run the application in production
+# This should execute your 'start' script defined in package.json
+# Assuming your start script runs `node build/server.js`
+CMD [ "node", "build/server.js" ]
+# Alternative using npm/yarn/pnpm start script (if your start script is just 'node build/server.js'):
+# CMD [ "npm", "start" ] # Or "yarn", "start" or "pnpm", "start"
